@@ -24,10 +24,17 @@
  * Status responses:
  * Format [STATUS CODE] String Description
  * 500 Bad Request
- * 200 Processing
  * 400 Internal Error
  * 401 No Data
  * 201 Success
+ *
+ *
+ * Known issues: 
+ *
+ * -> connect() takes far too long to time out by default,
+ * so commanding the server to hash on a port that isn't open takes
+ * over a minute to return an error code
+ * https://stackoverflow.com/a/2597669
  *
 */
 #include <stdio.h>
@@ -52,7 +59,7 @@ void hash_file(const char *filename, unsigned char* hash) {
 
     FILE* file; 
     if ((file = fopen(filename, "r")) == NULL) {
-        perror("verify-upload: error opening file in hash_file:");
+        perror("hash-service: error opening file in hash_file:");
     }
 
     unsigned char read_buf[64];
@@ -64,7 +71,7 @@ void hash_file(const char *filename, unsigned char* hash) {
     sha256_final(&ctx, hash);
     
     if (fclose(file) != 0) {
-        perror("verify-upload: error closing file in hash_file");
+        perror("hash-service: error closing file in hash_file");
     }
 }
 
@@ -172,7 +179,7 @@ void* control_session(void* arg) {
 
             if (strcmp("HASH", strtok(line_buffer.line, " "))) {
                 if (send(sock, syntax_err, strlen(syntax_err), 0) < 0) {
-                    perror("verify-upload: error sending 500 Bad Request");
+                    perror("hash-service: error sending 500 Bad Request");
                 }
                 continue;
             }
@@ -180,7 +187,7 @@ void* control_session(void* arg) {
             char* arg;
             if ((arg = strtok(NULL, " ")) == NULL) {
                 if (send(sock, syntax_err, strlen(syntax_err), 0) < 0) {
-                    perror("verify-upload: error sending 500 Bad Request");
+                    perror("hash-service: error sending 500 Bad Request");
                 }
                 continue;
             }
@@ -188,7 +195,7 @@ void* control_session(void* arg) {
             int port = strtol(arg, &endptr, 10);
             if (*endptr != '\0') {
                 if (send(sock, syntax_err, strlen(syntax_err), 0) < 0) {
-                    perror("verify-upload: error sending 500 Bad Request");
+                    perror("hash-service: error sending 500 Bad Request");
                 }
                 continue;
             }
@@ -196,15 +203,15 @@ void* control_session(void* arg) {
             //connect to port and commence hashing!
             int ftp_socket = socket(AF_INET, SOCK_STREAM, 0);
             if (ftp_socket == -1) {
-                perror("verify-upload: ftp socket creation failed");
+                perror("hash-service: ftp socket creation failed");
                 if (send(sock, internal_err, strlen(internal_err), 0) < 0) {
-                    perror("verify-upload: error sending 400 Internal Error");
+                    perror("hash-service: error sending 400 Internal Error");
                 }
                 continue;
             }
 
             struct sockaddr_in addr;
-            populate_sockaddr(&addr, port, "68.187.67.135");
+            populate_sockaddr(&addr, port, "127.0.0.1");
             
             struct timeval timeout;
             timeout.tv_sec = 5;
@@ -212,20 +219,20 @@ void* control_session(void* arg) {
 
             if (setsockopt (ftp_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
                 sizeof(timeout)) < 0) {
-                perror("verify-upload: setsockopt failed");
+                perror("hash-service: setsockopt failed");
             }
 
             /*
             if (setsockopt (ftp_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
                 sizeof(timeout)) < 0) {
-                perror("verify-upload: setsockopt failed");
+                perror("hash-service: setsockopt failed");
             }
             */
 
             if (connect(ftp_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-                perror("verify-upload: ftp connection failed");
+                perror("hash-service: ftp connection failed");
                 if (send(sock, internal_err, strlen(internal_err), 0) < 0) {
-                    perror("verify-upload: error sending 400 Internal Error");
+                    perror("hash-service: error sending 400 Internal Error");
                 }
                 continue;
             }
@@ -237,13 +244,13 @@ void* control_session(void* arg) {
                         fprintf(stderr, "ftp connection timed out\n");
                         break;
                     default:
-                        perror("verify-upload: ftp connection");
+                        perror("hash-service: ftp connection");
                 }
                 if (send(sock, nodata_err, strlen(nodata_err), 0) < 0) {
-                    perror("verify-upload: error sending 401 No Data");
+                    perror("hash-service: error sending 401 No Data");
                 }
                 if(close(ftp_socket)) {
-                    perror("verify-upload: error closing ftp socket");
+                    perror("hash-service: error closing ftp socket");
                 }
                 continue;
             }
@@ -251,14 +258,14 @@ void* control_session(void* arg) {
             sprintf(hashdump, "%s\r\n", hash_to_string(hash));
 
             if (send(sock, success, strlen(success), 0) < 0) {
-                perror("verify-upload: error sending 200 Success");
+                perror("hash-service: error sending 200 Success");
             }
             if (send(sock, hashdump, strlen(hashdump), 0) < 0) {
-                perror("verify-upload: error sending hexdump");
+                perror("hash-service: error sending hexdump");
             }
 
             if(close(ftp_socket)) {
-                perror("verify-upload: error closing ftp socket");
+                perror("hash-service: error closing ftp socket");
             }
             
         }
@@ -276,7 +283,7 @@ end:
             fprintf(stderr, "Client timed out\n");
             break;
         default:
-            perror("verify-upload: control socket receive failed");
+            perror("hash-service: control socket receive failed");
         }
     }
     
@@ -288,7 +295,7 @@ void run_server(int ftp_server_port, int upload_port) {
     //wait for connection from client
     int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (client_sockfd == -1) {
-        perror("verify-upload: socket create failed");
+        perror("hash-service: socket create failed");
         exit(EXIT_FAILURE);
     }
 
@@ -296,12 +303,12 @@ void run_server(int ftp_server_port, int upload_port) {
     populate_sockaddr(&addr, upload_port, "0.0.0.0");
 
     if (bind(client_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("verify-upload: bind failed");
+        perror("hash-service: bind failed");
         exit(EXIT_FAILURE);
     }
 
     if (listen(client_sockfd, 5) < 0) {
-        perror("verify-upload: listen failed");
+        perror("hash-service: listen failed");
         exit(EXIT_FAILURE);
     }
 
@@ -319,34 +326,37 @@ void run_server(int ftp_server_port, int upload_port) {
 
         if (setsockopt (insocket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
             sizeof(timeout)) < 0) {
-            perror("verify-upload: setsockopt failed");
+            perror("hash-service: setsockopt failed");
         }
 
         if (setsockopt (insocket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
             sizeof(timeout)) < 0) {
-            perror("verify-upload: setsockopt failed");
+            perror("hash-service: setsockopt failed");
         }
 
         pthread_t control_thread;
 
+        printf("Creating control thread for client at %s:%d\n",
+                inet_ntoa(in_addr.sin_addr), ntohs(in_addr.sin_port));
+
         if (pthread_create(&control_thread, NULL, control_session, &insocket)) {
-            perror("verify-upload: pthread_create failed");
+            perror("hash-service: pthread_create failed");
         }
         else {
             void* retval;
             if (pthread_join(control_thread, &retval) < 0) { 
-                perror("verify-upload: pthread_join failed");
+                perror("hash-service: pthread_join failed");
             }
             printf("Thread terminated\n");
         }
 
         if (close(insocket) < 0) {
-            perror("verify-upload: close failed");
+            perror("hash-service: close failed");
         }
 
     }
 
-    perror("verify-upload: accept failed");
+    perror("hash-service: accept failed");
     
     
 }
