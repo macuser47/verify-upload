@@ -17,7 +17,11 @@ TEST_EXECS := $(filter-out $(TESTS_EXCLUDE_PATH), $(TEST_ALL_EXECS))
 
 all: $(MAIN_EXECS) 
 
-.PHONY: test clean
+.PHONY: test clean install
+
+install: verify-upload hash-service
+	cp hash-service /usr/local/bin
+	cp verify-upload /usr/local/bin
 
 verify-upload: verify-upload.c $(SRC_DEPS) 
 	$(CC) -o $@ $^ $(CFLAGS) $(LIBS)
