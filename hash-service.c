@@ -291,7 +291,7 @@ end:
 }
 
 
-void run_server(int ftp_server_port, int upload_port) {
+void run_server(int upload_port) {
     //wait for connection from client
     int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (client_sockfd == -1) {
@@ -361,20 +361,23 @@ void run_server(int ftp_server_port, int upload_port) {
     
 }
 
-void upload(char* hostname, int port) {
-     
-}
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "ligma lmao\n");
+    if (argc > 2) {
+        fprintf(stderr, "Usage: hash-service [port=8009]\n");
         exit(EXIT_FAILURE);
     }
-    /*
-    unsigned char hash[32];
-    hash_file(argv[1], hash);
-    printf("%s\n", hash_to_string(hash));
-    */
-    run_server(21, 8009);
+
+    int port = 8009;
+    if (argc == 2) {
+        char* endptr;
+        port = strtol(argv[1], &endptr, 10);
+        if (*endptr != '\0') {
+            fprintf(stderr, "Error: invalid port\n");
+            exit(EXIT_FAILURE);
+        }
+    }        
+
+    run_server(port);
     return 0;
 }
