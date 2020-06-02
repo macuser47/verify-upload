@@ -1,5 +1,7 @@
 /*
  * verify-upload: a verification layer for FTP transfers
+ *
+ * What follows is a loathsome piece of code that should not rightfully exist.
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,13 +12,25 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <time.h>
 #include "sha256.h"
+#include "virtual-fd.h"
 
-typedef struct {
-    int client_fd;
-    int server_fd;
-} ProxyPair;
+#define SERVICE_NAME 0
+#define USER_REPLY 1
+#define PASS_REPLY 2
+#define MODE_REPLY 3
+#define TYPE_REPLY 4
+#define PASV_REPLY 5
+#define STOR_REPLY 6
+#define COMPLETE_REPLY 7
+#define PASV2_REPLY 8
+#define RETR_REPLY 9
+#define RETR_REPLY2 10
 
 char* hash_to_string(const unsigned char*);
 
@@ -59,30 +73,58 @@ void populate_sockaddr(struct sockaddr_in * addr, int port, char* ip) {
     inet_aton(ip, &addr->sin_addr);
 }
 
+void progress_bar(const int total, const int progress, const int length, 
+        char** bar_string) {
+
+    if (*bar_string == NULL) {
+        *bar_string = malloc(length + 1);
+    } 
+    else {
+        *bar_string = realloc(*bar_string, length + 1);
+    }
+
+    int fill_length = (int)(((double)progress / total) * length);
+    int i;
+    for (i = 0; i < fill_length - 1; (*bar_string)[i++]='=');
+    (*bar_string)[i++] = '>';
+    for (; i < length; (*bar_string)[i++]=' ');
+    (*bar_string)[i] = '\0';
+}
+
+
+/*int get_sock_line(int fd) {
+    //brrt
+    int status;
+    for (char c = 0, int i = 0; c != '\n ; i++) {
+        status = recv(fd, &c, 1, MSG_PEEK);
+
+        if (status < 0) {
+            return status;
+        }
+    }
+
+    return i;
+}*/
+
 typedef struct {
     char line[1024];
     char* endptr;
+    char* readptr;
 } LineBuffer;
 
 void init_line_buffer(LineBuffer* buf) {
     buf->endptr = buf->line;
-}
-
-//purge current line from buffer and shift in rest of buffer
-void consume_line(LineBuffer* buf) {
-    memcpy(buf->line, buf->endptr, 1024 - (buf->endptr - buf->line));
+    buf->readptr = NULL;
 }
 
 //buffer line from socket buffer
 //returns 0 if no line found, 1 if line found
 int get_sock_line(LineBuffer* buf, char* read_buf, size_t read_buf_size) {
-
-    static char* i = NULL;
-    if (i == NULL) {
-        i = read_buf;
+    if (buf->readptr == NULL) {
+        buf->readptr = read_buf;
     }
 
-    for (; i < read_buf + read_buf_size - 1; i++) {
+    for (; buf->readptr < read_buf + read_buf_size - 1; buf->readptr++) {
 
         //reset ptr if it goes beyond the buffer
         if (buf->endptr - buf->line >= sizeof(buf->line)) {
@@ -90,262 +132,760 @@ int get_sock_line(LineBuffer* buf, char* read_buf, size_t read_buf_size) {
         }
 
         //detect \r\n
-        if (*i == '\r' && *(i+1) == '\n') {
-            i++;
+        if (*buf->readptr == '\r' && *(buf->readptr+1) == '\n') {
+            buf->readptr++;
             *buf->endptr = '\0';
             buf->endptr = buf->line;
 
             return 1;
         } 
 
-        *buf->endptr++ = *i;
+        *buf->endptr++ = *buf->readptr;
     }
 
-    i = NULL;
+    buf->readptr = NULL;
     return 0;
 }
 
-enum state_t {WAITING_FOR_HASH = 0, WAITING_FOR_PASV = 1, HASHING = 3};
-enum state_t proxy_state = WAITING_FOR_HASH;
-char file_to_hash[64];
-
-void* proxy_thread(void* arg) {
-    ProxyPair* p = (ProxyPair*)arg;
-
-    LineBuffer line_buffer;
-    init_line_buffer(&line_buffer);
-
-    char buf[1024];
-    int read_sz;
-    while((read_sz = recv(p->client_fd, buf, sizeof(buf), 0)) > 0) {
-
-        char* consume_ptr = buf; //offset to consume lines not for ftp server
-        size_t consumed_sz = 0;
-
-        //check if complete line buffered
-        while (get_sock_line(&line_buffer, buf, read_sz)) {
-            printf("Got \"%s\"\n", line_buffer.line);
-
-            //decide if buffer should be purged
-            size_t length = strlen(line_buffer.line);
-
-            if (strncmp("HASH", strtok(line_buffer.line, " "), 4) == 0) {
-
-                //hash command consumes line. 
-                //respond to hash and
-                //shift buffer over.
-                consume_ptr += length + 1;
-                consumed_sz += length + 1;
-                
-                char* hash_target;
-                if ((hash_target = strtok(NULL, " ")) == NULL) {
-                    //send error back to client
-                    char* error = "500 Bad Request\r\n";
-                    if (send(p->client_fd, error, strlen(error), 0) < 0) {
-                        perror("verify-upload: error sending 500 to client");
-                    }
-                    continue;
-                }
-                strncpy(file_to_hash, hash_target, sizeof(file_to_hash));
-
-                //issue PWD to server
-                char* pwd_buf = "PWD\r\n";
-                if (send(p->server_fd, pwd_buf, strlen(pwd_buf), 0) < 0) {
-                    perror("verify-upload: error sending PWD\n");
-                    continue;
-                }
-                proxy_state = WAITING_FOR_PASV;
-
-            }
-        }
-
-        memmove(buf, consume_ptr, 1024 - consumed_sz); 
-
-        send(p->server_fd, buf, read_sz - consumed_sz, 0);
+//gets response code
+//clobbers string
+//returns -1 on error
+int response_code(char* reply) {
+    char* arg;
+    if ((arg = strtok(reply, " ")) == NULL) {
+        return -1;     
     }
-
-    switch (read_sz) {
-    case 0:
-        printf("Client closed connection\n");
-        break;
-    default:
-        perror("verify-upload: reverse proxy error");
-        return NULL;
+    char* endptr;
+    int code = strtol(arg, &endptr, 10);
+    if (*endptr != '\0') {
+        return -1;
     }
-
-    return NULL; 
+    return code;
 }
 
-void* reverse_proxy_thread(void* arg) {
-    ProxyPair* p = (ProxyPair*)arg;
+enum ResponseType { FTP_CONTINUE, FTP_SUCCESS, FTP_NEED_MORE, 
+    FTP_INTERNAL_ERROR, FTP_FAIL};
 
-    LineBuffer line_buffer;
-    init_line_buffer(&line_buffer);
-
-    char buf[1024];
-    int read_sz;
-    while((read_sz = recv(p->server_fd, buf, sizeof(buf), 0)) > 0) {
-        //intercept PWD reads
-        if (proxy_state == WAITING_FOR_PASV) {
-            while (get_sock_line(&line_buffer, buf, read_sz)) {
-                char* error = 
-                    "451 Requested action aborted: local error in processing.\r\n";
-
-                char* success = "200 Success\r\n";
-
-                char* response_code_str = strtok(line_buffer.line, " ");
-                char* endptr;
-
-                int response_code = strtol(response_code_str, &endptr, 10); 
-                if (*endptr != '\0') {
-                    perror("verify-upload: bad response from ftp server");
-                    send(p->client_fd, error, strlen(error), 0); 
-                    continue;
-                }
-
-                if (response_code != 257) {
-                    send(p->client_fd, error, strlen(error), 0); 
-                    continue;
-                }
-
-                printf("%s\n", strtok(NULL, "\""));
-
-                /*if (strcmp("", strtok(NULL, "\"")) != 0) {
-                    send(p->client_fd, error, strlen(error), 0); 
-                    continue;
-                }*/
-                
-                send(p->client_fd, success, strlen(success), 0);
-                proxy_state = WAITING_FOR_HASH; 
-            }
-        }
-        else {
-            send(p->client_fd, buf, read_sz, 0); 
-        }
+enum ResponseType response_type(int code) {
+    int code_prefix = code / 100;
+    switch (code_prefix) {
+    case 1:
+        return FTP_CONTINUE;
+    case 2:
+        return FTP_SUCCESS;
+    case 3:
+        return FTP_NEED_MORE;
+    case 4:
+        return FTP_INTERNAL_ERROR;
+    case 5:
+        return FTP_FAIL;
     }
-
-    switch (read_sz) {
-    case 0:
-        printf("FTP server closed connection\n");
-        break;
-    default:
-        perror("verify-upload: reverse proxy error");
-        return NULL;
-    }
-
-    return NULL;
+    return -1;
 }
 
-void run_server(int ftp_server_port, int upload_port) {
-    //wait for connection from client
-    int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_sockfd == -1) {
-        perror("verify-upload: socket bind failed");
-        exit(EXIT_FAILURE);
+struct FtpCredentials {
+    char* uname;
+    char* passwd;
+};
+
+struct FtpCredentials default_credentials = {"ftp", "ftp"};
+
+int human_order(const long int bytes) {
+    if (bytes >> 50) {
+        return 50;
     }
-
-    struct sockaddr_in addr;
-    populate_sockaddr(&addr, upload_port, "0.0.0.0");
-
-    if (bind(client_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("verify-upload: bind failed");
-        exit(EXIT_FAILURE);
+    if (bytes >> 40) {
+        return 40;
     }
-
-    if (listen(client_sockfd, 5) < 0) {
-        perror("verify-upload: listen failed");
-        exit(EXIT_FAILURE);
+    if (bytes >> 30) {
+        return 30;
     }
+    if (bytes >> 20) {
+        return 20;
+    }
+    if (bytes >> 10) {
+        return 10;
+    }
+    return 0;
+}
 
-    struct sockaddr_in in_addr;
-    socklen_t in_len = sizeof(in_addr);
-    int insocket;
+void apply_human_order(const long int bytes, int order, char* buf, size_t size) {
+    switch (order) {
+    case 0:
+        snprintf(buf, size, "%ldB", bytes);
+        return;
+    case 10:
+        snprintf(buf, size,"%ldKB", bytes >> 10);    
+        return;
+    case 20:
+        snprintf(buf, size, "%ldMB", bytes >> 20);
+        return;
+    case 30:
+        snprintf(buf, size, "%ldGB", bytes >> 30);
+        return;
+    case 40:
+        snprintf(buf, size, "%ldTB", bytes >> 40);
+        return;
+    case 50:
+        snprintf(buf, size, "%ldPB", bytes >> 50);
+        return;
+    }
+}
 
-    while ((insocket = 
-        accept(client_sockfd, (struct sockaddr*)&in_addr, &in_len)) != -1) {
+void apply_human_order_float(const long int bytes, int order, char* buf, size_t size) {
+    switch (order) {
+    case 0:
+        snprintf(buf, size, "%0.2fB", (float)bytes);
+        return;
+    case 10:
+        snprintf(buf, size,"%0.2fKB", (float)bytes / (1 << 10));    
+        return;
+    case 20:
+        snprintf(buf, size, "%0.2fMB", (float)bytes / (1 << 20));
+        return;
+    case 30:
+        snprintf(buf, size, "%0.2fGB", (float)bytes / (1 << 30));
+        return;
+    case 40:
+        snprintf(buf, size, "%0.2fTB", (float)bytes / ((long int)1 << 40));
+        return;
+    case 50:
+        snprintf(buf, size, "%0.2fPB", (float)bytes / ((long int)1 << 50));
+        return;
+    }
+}
 
-        int server_sockfd;
-        pid_t pid = fork();
-        switch (pid){
-        case -1:
-            perror("verify-upload: fork failed");
-            exit(EXIT_FAILURE);
-        case 0:
-            //make connection to server on connection init    
-            server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+void bytes_to_human_f(const long int bytes, char* buf, size_t size) {
+    apply_human_order_float(bytes, human_order(bytes), buf, size);
+}
 
-            struct sockaddr_in server_addr;
-            populate_sockaddr(&server_addr, ftp_server_port, "68.187.67.135");
+void bytes_to_human(const long int bytes, char* buf, size_t size) {
+    apply_human_order(bytes, human_order(bytes), buf, size);
+}
+
+//write progress bar to the screen 
+//returns time in seconds sice last call
+double write_progress(VirtualFd* vstdout, long int accum_sent, 
+        long int filesize, int width) {
+    static struct timespec last_time;
+    static long int last_accum = 0;
     
-            if (connect(server_sockfd, 
-                (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-                perror("verify-upload: ftp connect failed");
-                exit(EXIT_FAILURE);
-            }
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
 
-            ProxyPair p = {
-                .client_fd = insocket,
-                .server_fd = server_sockfd
-            };
+    double elapsed_time = (time.tv_sec - last_time.tv_sec) + 
+        ((time.tv_nsec - last_time.tv_nsec) / 1000000000.0);
+    last_time = time;
 
-            pthread_t proxy_t, reverse_proxy_t;
 
-            if(pthread_create(&reverse_proxy_t, NULL, 
-                reverse_proxy_thread, &p)) {
-                perror("verify-upload: reverse proxy thread creation failed");
-                exit(EXIT_FAILURE);
-            }
-            if(pthread_create(&proxy_t, NULL, proxy_thread, &p)) {
-                perror("verify-upload: proxy thread creation failed");
-                exit(EXIT_FAILURE);
-            }
+    double marginal_bytes = (double)(accum_sent - last_accum);
+    last_accum = accum_sent;
 
-            //wait for threads :)
-            void* retval;
-            if (pthread_join(proxy_t, &retval)) {
-                perror("verify-upload: proxy thread join failed");
-                exit(EXIT_FAILURE);
+    double speed = marginal_bytes / elapsed_time;
+
+    char speed_human[16];
+    char accum_human[16];
+    char size_human[16];
+
+    char data_line[24];
+    char* bar_string = NULL;
+
+    int size_order = human_order(filesize);
+    bytes_to_human_f(filesize, size_human, sizeof(size_human));
+
+    int accum_order = human_order(accum_sent);
+    bytes_to_human_f(accum_sent, accum_human, sizeof(accum_human));
+
+    //truncate unit if order matches
+    if (accum_order == size_order) {
+        char* endptr;
+        strtod(accum_human, &endptr);
+        *endptr = '\0';
+    }
+    else { //truncate decimal otherwise
+        char* endptr;
+        strtol(accum_human, &endptr, 10);
+
+        char* dec_endptr;
+        strtod(accum_human, &dec_endptr);
+
+        strcpy(endptr, dec_endptr);
+    }
+
+    bytes_to_human_f(speed, speed_human, sizeof(speed_human));
+
+    snprintf(data_line, sizeof(data_line), "%s/%s %s/s", accum_human, size_human,
+            speed_human);
+
+    //create progress bar
+    progress_bar(filesize, accum_sent, width - (strlen(data_line)+2), 
+        &bar_string);
+
+    vfd_printf_static(vstdout, "[%s]%s", bar_string, data_line);
+    free(bar_string);
+
+    return elapsed_time;
+}
+
+//hash and upload files :)
+//returns 0 on success, -1 on error
+int ftp_stream_upload(int pasv_fd, char* path, int bufsize) {
+
+    //open path
+    FILE* file; 
+    if ((file = fopen(path, "r")) == NULL) {
+        perror("verify-upload: error opening file for upload");
+        return -1;
+    }
+
+    //get file size for progress bar
+    struct stat stats;
+    if (fstat(fileno(file), &stats) < 0) {
+        perror("verify-upload: error statting file for upload");
+        return -1;
+    }
+
+    off_t filesize = stats.st_size;
+    
+    //set up vfd
+    struct winsize win;
+    ioctl(STDIN_FILENO, TIOCGWINSZ, &win);
+    
+    VirtualFd vstdout;
+    init_vfd(&vstdout, stdout, win.ws_col);
+
+
+    //dynamic memory so we can support lil' ram computers and still
+    //have sane speeds on normal pcs
+    char* buf = malloc(bufsize);
+    long long int accum_sent = 0;
+    int read_size;
+
+    int actual_size = 1 << 10; //start at 1k and double until write time is ~0.5s
+
+    while((read_size = fread(buf, 1, actual_size, file)) != 0) {
+        double q;
+        if((q = write_progress(&vstdout, accum_sent, filesize, win.ws_col)) < 0.5) {
+            if (actual_size * 1.2 < bufsize) {
+                actual_size *= 1.2;
             }
-            if (pthread_join(reverse_proxy_t, &retval)) {
-                perror("verify-upload: reverse proxy thread join failed");
-                exit(EXIT_FAILURE);
+            else {
+                actual_size = bufsize;
             }
+            /*
+            char buf[24];
+            bytes_to_human(actual_size, buf, sizeof(buf));
+            vfd_printf(&vstdout, "Buffer size: %s\n", buf);
+            */
+        }
+
+        if (send(pasv_fd, buf, read_size, 0) < 0) {
+            perror("verify-upload: error sending file data");
+            free(buf);
+            return -1; 
+        }
+        accum_sent += read_size;
+    }
+    write_progress(&vstdout, accum_sent, filesize, win.ws_col);
+
+    free(buf);
+
+    fclose(file);
+    close(pasv_fd);
+    return 0;
+}
+
+//parse ftp pasv line to sockaddr_in
+int parse_pasv_response(char* response, struct sockaddr_in* addr) {
+    char* pasv_tuple_str;
+    if ((pasv_tuple_str = strchr(response, '(') + 1) == NULL) {
+        return -1;
+    }
+                
+    uint8_t pasv_tuple[6];
+    char* tuple_head = pasv_tuple_str;
+    char* endptr;
+    for (int i = 0; i < 6; i++) {
+        pasv_tuple[i] = strtol(tuple_head, &endptr, 10);
+        if (i < 5 && *endptr != ',') {
+            return -1;
+        }
+        else if (i == 5 && *endptr != ')') {
+            return -1;
+        }
+        tuple_head = endptr + 1;
+    }
+
+    char pasv_ip[24];
+    snprintf(pasv_ip, sizeof(pasv_ip), "%d.%d.%d.%d", 
+            pasv_tuple[0], pasv_tuple[1], pasv_tuple[2], pasv_tuple[3]);
+
+    int port = pasv_tuple[4] << 8 | pasv_tuple[5];
+
+    populate_sockaddr(addr, port, pasv_ip);
+    return 0;
+}
+
+//connect to hashing service and hash file
+int hashservice_hash(struct sockaddr_in* addr, int commandport, char** hash_string) {
+    //use ftp error codes because they're the same for hashservice 
+    int hash_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (hash_fd == -1) {
+        perror("verify-upload: error creating hash service socket");
+        return -1;
+    }
+
+    if (connect(hash_fd, (struct sockaddr*)addr, sizeof(struct sockaddr_in)) < 0) { 
+        perror("verify-upload: error connecting to hash service");
+        return -1;
+    }
+
+    //send request
+    char cmd[30];
+    snprintf(cmd, sizeof(cmd), "HASH %d\r\n", commandport);
+    printf("Sending \"%s\" to hash service\n", cmd);
+    if (send(hash_fd, cmd, strlen(cmd), 0) < 0) {
+        perror("verify-upload: error sending hash request");
+        return -1;
+    }
+
+    //wait for response
+    LineBuffer line_buf;
+    init_line_buffer(&line_buf);
+
+    char buf[1024];
+    int line = 0;
+    int read_sz;
+    while((read_sz = recv(hash_fd, buf, sizeof(buf), 0)) > 0) {
+        while(get_sock_line(&line_buf, buf, read_sz) > 0) { 
+            printf("Got line: %s\n", line_buf.line);
+
+            enum ResponseType hash_resp;
+
+            switch(line++) {
+            case 0:
+                //get status code
+                if ((hash_resp = response_type(response_code(line_buf.line))) < 0) {
+                    fprintf(stderr, "Bad response from hash sever: %s\n", 
+                        strtok(NULL, "\0"));
+                    close(hash_fd);
+                    return -1;
+                }
+
+                if (hash_resp != FTP_SUCCESS) {
+                   fprintf(stderr, "Bad response code from hash sever: %s\n",
+                        strtok(NULL, "\0"));
+                    close(hash_fd);
+                    return -1;
+                }
+                break;
+
+            case 1:
+                //get hash string :)
+                *hash_string = malloc(strlen(line_buf.line));
+                strcpy(*hash_string, line_buf.line);
+
+                close(hash_fd);
+                return 0;
+            }
+        }
+    }
+
+    switch (read_sz) {
+    case 0:
+        fprintf(stderr, "Hash server connection closed unexpectedly\n");
+        break;
+    default:
+        perror("verify-upload: error negotiating with hash server");
+    }
+
+
+    return -1;
+}
+
+//uploads file to ftp server using PASV, mode S, type L 8
+int upload(char* hostname, int port, struct FtpCredentials creds, 
+        char* filename, char* path) {
+    int returncode = 0;
+
+    //connect to ftp server
+    int ftp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (ftp_fd < 0) {
+        perror("verify-upload: error creating ftp connection");
+        return -1;
+    }
+
+    //TODO: support DNS w/gethostbyname(3)
+    struct sockaddr_in addr;
+    populate_sockaddr(&addr, port, hostname);
+
+    if (connect(ftp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("verify-upload: error connecting to ftp server");
+        return -1;
+    }
+    
+    int pasv_fd;
+    struct sockaddr_in pasv2_addr;
+    char* hash_response; 
+ 
+    LineBuffer line_buf;
+    init_line_buffer(&line_buf);
+
+    char buf[1024];
+    int line = 0;
+    int read_sz;
+
+    //round counter to indicate 
+    //which ftp session is taking place
+    //0 - upload session
+    //1 - hash verification session
+    int round = 0;
+    while((read_sz = recv(ftp_fd, buf, sizeof(buf), 0)) > 0) {
+        while(get_sock_line(&line_buf, buf, read_sz) > 0) { 
+            printf("Got line: %s\n", line_buf.line);
             
-            printf("Process closing (%d). Goodbye world!\n", getpid()); 
-            exit(EXIT_SUCCESS);
+            enum ResponseType ftp_resp;
+            if ((ftp_resp = response_type(response_code(line_buf.line))) < 0) {
+                fprintf(stderr, "verify-upload: bad response from sever");
+                returncode = -1;
+                goto end;
+            }
 
+            char* errc = line_buf.line;
+            char* rest_of_response = strtok(NULL, "\0");
+
+            switch (line++) {
+            case SERVICE_NAME:
+                //read service name line
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "Bad response from server: %s %s\n",
+                        errc, rest_of_response);
+                }
+                else {
+                    printf("Connected to ftp server: %s\n", rest_of_response);
+                }
+
+                //reply with user login
+                char user_cmd[64];
+                snprintf(user_cmd, sizeof(user_cmd), "USER %s\r\n", creds.uname);
+                if (send(ftp_fd, user_cmd, strlen(user_cmd), 0) < 0) {
+                    perror("verify-upload: error sending user login");
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+            case USER_REPLY:
+                //check response code
+                if (ftp_resp != FTP_SUCCESS && ftp_resp != FTP_NEED_MORE) {
+                    fprintf(stderr, "verify-upload: bad response code to login: %s\n",
+                            errc);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //send password
+                char pwd_cmd[64];
+                snprintf(pwd_cmd, sizeof(user_cmd), "PASS %s\r\n", creds.passwd);
+                if (send(ftp_fd, pwd_cmd, strlen(pwd_cmd), 0) < 0) {
+                    perror("verify-upload: error sending user login");
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+
+            case PASS_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to password: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+                printf("Successfuly logged in as %s\n", creds.uname);
+
+                //send mode configuration
+                char* mode_cmd = "MODE S\r\n";
+                if (send(ftp_fd, mode_cmd, strlen(mode_cmd), 0) < 0) {
+                    perror("verify-upload: error sending mode");
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+
+            case MODE_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to mode change: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //send data type configuration
+                char* type_cmd = "TYPE L 8\r\n";
+                if (send(ftp_fd, type_cmd, strlen(type_cmd), 0) < 0) {
+                    perror("verify-upload: error sending type");
+                    returncode = -1;
+                    goto end;
+                }
+                
+                if (round == 1) {
+                    line = COMPLETE_REPLY;
+                }
+
+                break;
+
+            case TYPE_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to mode change: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //send pasv 
+                char* pasv_cmd = "PASV\r\n";
+                if (send(ftp_fd, pasv_cmd, strlen(pasv_cmd), 0) < 0) {
+                    perror("verify-upload: error sending pasv");
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+
+            case PASV_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to mode change: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //parse pasv reply
+                struct sockaddr_in pasv_addr;
+                parse_pasv_response(rest_of_response, &pasv_addr);
+
+                printf("Configuring to PASV server at %s:%d\n", 
+                        inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+
+                //request upload for file
+                char stor_cmd[64];
+                snprintf(stor_cmd, sizeof(stor_cmd), "STOR %s\r\n", filename);
+                if (send(ftp_fd, stor_cmd, strlen(stor_cmd), 0) < 0) {
+                    perror("verify-upload: error sending stor command");
+                    returncode = -1;
+                    goto end;
+                }
+
+                //sleep needed for processing time...
+                sleep(1);
+
+                //connect to pasv port!
+                printf("Connecting to PASV server and uploading '%s' as '%s\n'",
+                        path, filename);
+
+                pasv_fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (pasv_fd < 0) {
+                    perror("verify-upload: error creating pasv socket");
+                    returncode = -1;
+                    goto end;
+                }
+
+                if (connect(pasv_fd, (struct sockaddr*)&pasv_addr, sizeof(pasv_addr)) 
+                        < 0) {
+                    perror("verify-upload: error connecting to ftp pasv socket");
+                    returncode = -1;
+                    goto end;
+                }
+
+                printf("Connected!\n");
+                break;
+
+            case STOR_REPLY:
+                if (ftp_resp != FTP_CONTINUE) {
+                    fprintf(stderr, "bad response code to stor: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //upload file!
+                //default to 4M blocksize
+                printf("Uploading...\n");
+                if (ftp_stream_upload(pasv_fd, path, 1 << 22) < 0) {
+                    fprintf(stderr, "Upload failed.");
+                    returncode = -1;
+                    goto end;
+                }
+                printf("done!\n");
+
+
+                //disconnect and prepare for verification sesson
+                //why? -> we can't assume this session hasn't timed out
+                //(it will for large uploads)
+                close(ftp_fd);
+                round = 1;
+                
+                ftp_fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (ftp_fd == -1) {
+                    perror("verify-upload: error creating ftp2 socket");
+                    return -1;
+                }
+                
+
+                if (connect(ftp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                    perror("verify-upload: error connecting to ftp server (2)");
+                    return -1;
+                }
+
+                line = SERVICE_NAME;
+                break;
+
+            //legacy name from before multi-session implementation
+            case COMPLETE_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to upload: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //request PASV for hash verification
+                char* pasv2_cmd = "PASV\r\n";
+                if (send(ftp_fd, pasv2_cmd, strlen(pasv2_cmd), 0) < 0) {
+                    perror("verify-upload: error sending pasv");
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+
+            case PASV2_REPLY:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to upload: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                //parse pasv data and populate addr for hash service
+                parse_pasv_response(rest_of_response, &pasv2_addr);
+
+                printf("Configuring hash service to PASV server at %s:%d\n", 
+                        inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+
+                //set custom port, record old as command port
+                int commandport = ntohs(pasv2_addr.sin_port);
+                pasv2_addr.sin_port = htons(8009);
+
+                //retrieve file from server
+                char retr_cmd[64];
+                snprintf(retr_cmd, sizeof(retr_cmd), "RETR %s\r\n", filename);
+                if (send(ftp_fd, retr_cmd, strlen(retr_cmd), 0) < 0) {
+                    perror("verify-upload: error sending retrieve command");
+                    returncode = -1;
+                    goto end;
+                } 
+
+
+                //conect to hash service to verify
+                printf("Connecting to hash service...\n");
+               
+                if (hashservice_hash(&pasv2_addr, commandport, &hash_response) < 0) {
+                    returncode = -1;
+                    goto end;
+                }
+
+                printf("Got hash response: %s\n", hash_response);
+
+                break;
+
+            case RETR_REPLY:
+                if (ftp_resp != FTP_CONTINUE) {
+                    fprintf(stderr, "bad response code to upload: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+                break;
+
+            case RETR_REPLY2:
+                if (ftp_resp != FTP_SUCCESS) {
+                    fprintf(stderr, "bad response code to upload: %s\n",
+                            line_buf.line);
+                    returncode = -1;
+                    goto end;
+                }
+
+                goto end;
+                
+            }
+        }
+    }
+
+end:
+
+    switch (read_sz) {
+    case 0:
+        printf("Disconnected from ftp server\n");
+        break;
+    default:
+        switch (errno) {
+        case EWOULDBLOCK:
+            fprintf(stderr, "Connection to ftp server timed out\n");
             break;
         default:
-            printf(
-                "Created child process %d to handle connection from %s\n",
-                pid,
-                inet_ntoa(in_addr.sin_addr)
-            );
-            break;
-
+            printf("Connection to ftp server terminated.\n");
+            //perror("verify-upload: receive failed");
         }
-
     }
 
-    perror("verify-upload: accept failed");
+    close(ftp_fd);
+
+    if (returncode) return returncode;
+
+    //verify that the hashes match
+    printf("Hashing local file...\n");
+
+    unsigned char hash[32];
+    hash_file(path, hash);
+
+    char* local_hash = hash_to_string(hash);
     
-    
+    printf("Local hash:  %s\n", local_hash);
+    printf("Remote hash: %s\n", hash_response);
+
+    if (strcmp(local_hash, hash_response) != 0) {
+        fprintf(stderr, "Hash comparison failed!\n");
+        return -1;
+    }
+
+    free(hash_response);
+
+    return 0;
 }
 
-void upload(char* hostname, int port) {
-     
-}
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         fprintf(stderr, "ligma lmao\n");
         exit(EXIT_FAILURE);
     }
-    /*
-    unsigned char hash[32];
-    hash_file(argv[1], hash);
-    printf("%s\n", hash_to_string(hash));
-    */
-    run_server(21, 8009);
-    return 0;
+
+    struct FtpCredentials c = {.uname="nas", .passwd="Thuc1220"};
+    char* remote_name = "endgame.opus";
+    char* local_path = "/home/fred/Music/godhunter/Endgame (The Winter Cavalry Remix)-AvpeiEMzyEE.opus";
+
+
+    //try to upload and verify the file a maximum of 5 times
+    for (int i = 0; i < 5; i++) {
+        if(upload("68.187.67.135", 21, c, remote_name, local_path) == 0) {
+            break;
+        }
+
+        if (i == 4) {
+            printf("Upload failed again. Something's borked. Aborting...\n");
+            return EXIT_FAILURE;
+        }
+
+        printf("Upload failed, trying again (%d)...\n", i+1);
+    }
+
+    return EXIT_SUCCESS;
 }
