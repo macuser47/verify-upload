@@ -17,8 +17,15 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <time.h>
+#include <getopt.h>
+#include <libgen.h>
 #include "sha256.h"
 #include "virtual-fd.h"
+
+#define PROGRAM_NAME "verify-upload"
+#define AUTHOR "Nic Hodlofski"
+#define VERSION "1.0"
+#define SITE "https://github.com/macuser47/verify-upload"
 
 #define SERVICE_NAME 0
 #define USER_REPLY 1
@@ -31,6 +38,8 @@
 #define PASV2_REPLY 8
 #define RETR_REPLY 9
 #define RETR_REPLY2 10
+    
+enum {LOUD, QUIET, NORMAL} loudness = NORMAL;
 
 char* hash_to_string(const unsigned char*);
 
@@ -321,7 +330,9 @@ double write_progress(VirtualFd* vstdout, long int accum_sent,
     progress_bar(filesize, accum_sent, width - (strlen(data_line)+2), 
         &bar_string);
 
-    vfd_printf_static(vstdout, "[%s]%s", bar_string, data_line);
+    if (loudness != QUIET) {
+        vfd_printf_static(vstdout, "[%s]%s", bar_string, data_line);
+    }
     free(bar_string);
 
     return elapsed_time;
@@ -352,7 +363,9 @@ int ftp_stream_upload(int pasv_fd, char* path, int bufsize) {
     ioctl(STDIN_FILENO, TIOCGWINSZ, &win);
     
     VirtualFd vstdout;
-    init_vfd(&vstdout, stdout, win.ws_col);
+    if (loudness != QUIET) {
+        init_vfd(&vstdout, stdout, win.ws_col);
+    }
 
 
     //dynamic memory so we can support lil' ram computers and still
@@ -443,7 +456,11 @@ int hashservice_hash(struct sockaddr_in* addr, int commandport, char** hash_stri
     //send request
     char cmd[30];
     snprintf(cmd, sizeof(cmd), "HASH %d\r\n", commandport);
-    printf("Sending \"%s\" to hash service\n", cmd);
+
+    if (loudness == LOUD) {
+        printf("Sending \"%s\" to hash service\n", cmd);
+    }
+
     if (send(hash_fd, cmd, strlen(cmd), 0) < 0) {
         perror("verify-upload: error sending hash request");
         return -1;
@@ -458,7 +475,9 @@ int hashservice_hash(struct sockaddr_in* addr, int commandport, char** hash_stri
     int read_sz;
     while((read_sz = recv(hash_fd, buf, sizeof(buf), 0)) > 0) {
         while(get_sock_line(&line_buf, buf, read_sz) > 0) { 
-            printf("Got line: %s\n", line_buf.line);
+            if (loudness == LOUD) {
+                printf("Got line: %s\n", line_buf.line);
+            }
 
             enum ResponseType hash_resp;
 
@@ -542,7 +561,9 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
     int round = 0;
     while((read_sz = recv(ftp_fd, buf, sizeof(buf), 0)) > 0) {
         while(get_sock_line(&line_buf, buf, read_sz) > 0) { 
-            printf("Got line: %s\n", line_buf.line);
+            if (loudness == LOUD) {
+                printf("Got line: %s\n", line_buf.line);
+            }
             
             enum ResponseType ftp_resp;
             if ((ftp_resp = response_type(response_code(line_buf.line))) < 0) {
@@ -560,9 +581,13 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                 if (ftp_resp != FTP_SUCCESS) {
                     fprintf(stderr, "Bad response from server: %s %s\n",
                         errc, rest_of_response);
+                    returncode = -1;
+                    goto end;
                 }
                 else {
-                    printf("Connected to ftp server: %s\n", rest_of_response);
+                    if (loudness == LOUD) {
+                        printf("Connected to ftp server: %s\n", rest_of_response);
+                    }
                 }
 
                 //reply with user login
@@ -600,7 +625,9 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                     returncode = -1;
                     goto end;
                 }
-                printf("Successfuly logged in as %s\n", creds.uname);
+                if (loudness == LOUD) {
+                    printf("Successfuly logged in as %s\n", creds.uname);
+                }
 
                 //send mode configuration
                 char* mode_cmd = "MODE S\r\n";
@@ -661,9 +688,11 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                 //parse pasv reply
                 struct sockaddr_in pasv_addr;
                 parse_pasv_response(rest_of_response, &pasv_addr);
-
-                printf("Configuring to PASV server at %s:%d\n", 
-                        inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+                
+                if (loudness == LOUD) {
+                    printf("Configuring to PASV server at %s:%d\n", 
+                            inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+                }
 
                 //request upload for file
                 char stor_cmd[64];
@@ -678,8 +707,10 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                 sleep(1);
 
                 //connect to pasv port!
-                printf("Connecting to PASV server and uploading '%s' as '%s\n'",
-                        path, filename);
+                if (loudness == LOUD) {
+                    printf("Connecting to PASV server and uploading '%s' as '%s\n'",
+                            path, filename);
+                }
 
                 pasv_fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (pasv_fd < 0) {
@@ -694,8 +725,10 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                     returncode = -1;
                     goto end;
                 }
-
-                printf("Connected!\n");
+                
+                if (loudness == LOUD) {
+                    printf("Connected!\n");
+                }
                 break;
 
             case STOR_REPLY:
@@ -708,13 +741,17 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
 
                 //upload file!
                 //default to 4M blocksize
-                printf("Uploading...\n");
+                if (loudness == LOUD) {
+                    printf("Uploading...\n");
+                }
                 if (ftp_stream_upload(pasv_fd, path, 1 << 22) < 0) {
                     fprintf(stderr, "Upload failed.");
                     returncode = -1;
                     goto end;
                 }
-                printf("done!\n");
+                if (loudness == LOUD) {
+                    printf("done!\n");
+                }
 
 
                 //disconnect and prepare for verification sesson
@@ -766,9 +803,11 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
 
                 //parse pasv data and populate addr for hash service
                 parse_pasv_response(rest_of_response, &pasv2_addr);
-
-                printf("Configuring hash service to PASV server at %s:%d\n", 
-                        inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+                
+                if (loudness == LOUD) {
+                    printf("Configuring hash service to PASV server at %s:%d\n", 
+                            inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+                }
 
                 //set custom port, record old as command port
                 int commandport = ntohs(pasv2_addr.sin_port);
@@ -785,14 +824,17 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
 
 
                 //conect to hash service to verify
-                printf("Connecting to hash service...\n");
+                if (loudness == LOUD) {
+                    printf("Connecting to hash service...\n");
+                }
                
                 if (hashservice_hash(&pasv2_addr, commandport, &hash_response) < 0) {
                     returncode = -1;
                     goto end;
                 }
-
-                printf("Got hash response: %s\n", hash_response);
+                if (loudness == LOUD) {
+                    printf("Got hash response: %s\n", hash_response);
+                }
 
                 break;
 
@@ -823,7 +865,9 @@ end:
 
     switch (read_sz) {
     case 0:
-        printf("Disconnected from ftp server\n");
+        if (loudness == LOUD) {
+            printf("Disconnected from ftp server\n");
+        }
         break;
     default:
         switch (errno) {
@@ -831,7 +875,9 @@ end:
             fprintf(stderr, "Connection to ftp server timed out\n");
             break;
         default:
-            printf("Connection to ftp server terminated.\n");
+            if (loudness == LOUD) {
+                printf("Connection to ftp server terminated.\n");
+            }
             //perror("verify-upload: receive failed");
         }
     }
@@ -841,15 +887,19 @@ end:
     if (returncode) return returncode;
 
     //verify that the hashes match
-    printf("Hashing local file...\n");
+    if (loudness != QUIET) {
+        printf("Hashing local file...\n");
+    }
 
     unsigned char hash[32];
     hash_file(path, hash);
 
     char* local_hash = hash_to_string(hash);
-    
-    printf("Local hash:  %s\n", local_hash);
-    printf("Remote hash: %s\n", hash_response);
+   
+    if (loudness != QUIET) { 
+        printf("Local hash:  %s\n", local_hash);
+        printf("Remote hash: %s\n", hash_response);
+    }
 
     if (strcmp(local_hash, hash_response) != 0) {
         fprintf(stderr, "Hash comparison failed!\n");
@@ -861,30 +911,159 @@ end:
     return 0;
 }
 
-
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "ligma lmao\n");
-        exit(EXIT_FAILURE);
+void usage(int status) {
+    if (status != EXIT_SUCCESS) {
+        fprintf(stderr, "Usage: %s [OPTION...] --server [IP]:[PORT] [FILE...]\n", 
+                PROGRAM_NAME);
+        fprintf(stderr, "Try '%s --help' for more information.\n", PROGRAM_NAME); 
+        exit(status);
     }
 
-    struct FtpCredentials c = {.uname="nas", .passwd="Thuc1220"};
-    char* remote_name = "endgame.opus";
-    char* local_path = "/home/fred/Music/godhunter/Endgame (The Winter Cavalry Remix)-AvpeiEMzyEE.opus";
+    printf("Usage: %s [OPTION...] --server <IP>:[PORT] [FILE...]\n", PROGRAM_NAME);
+    fputs("\
+\n\
+Connection Setup:\n\
+  -s, --server=IP:PORT          connect to the server given IP and port\n\
+  -u, --user=USERNAME           connect to the server with the specified username\n\
+                                (default: ftp)\n\
+  -p, --password=PASSWORD       connect to the server with the specified password\n\
+                                (default: will prompt for password)\n\
+\n\
+Configuration:\n\
+  -r, --retries=RETRIES         number of times to retry upload before giving up\n\
+                                (default: 5)\n\
+  -q, --quiet                   suppress console output and progress bar\n\
+  -l, --loud                    print connection status information\n\
+\n\
+Etc:\n\
+  -v, --version                 print version information\n\
+  -h, --help                    print this help message\n\
+\n\
+", stdout);
+    printf("See <%s> for more information.\n", SITE);
+    exit(status);
+}
+
+void version() {
+    printf("%s v%s\n", PROGRAM_NAME, VERSION);
+    printf("Written by %s\n", AUTHOR);
+    exit(EXIT_SUCCESS);
+}
 
 
-    //try to upload and verify the file a maximum of 5 times
-    for (int i = 0; i < 5; i++) {
-        if(upload("68.187.67.135", 21, c, remote_name, local_path) == 0) {
-            break;
+int main(int argc, char* argv[]) {
+    char* server = NULL;
+    char* username = "ftp";
+    char* password = NULL;
+    int retries = 5;
+
+    int opt;
+    static struct option const long_options[] = {
+        {"server",      required_argument,      NULL, 's'},
+        {"user",        required_argument,      NULL, 'u'},
+        {"password",    required_argument,      NULL, 'p'},
+        {"retries",     required_argument,      NULL, 'r'},
+        {"quiet",       no_argument,            NULL, 'q'},
+        {"loud",        no_argument,            NULL, 'l'},
+        {"version",     no_argument,            NULL, 'v'},
+        {"help",        no_argument,            NULL, 'h'},
+        {NULL,          0,                      NULL,  0 }
+    };
+
+    while ((opt = getopt_long(argc, argv, "s:u:p:r:qlvh", 
+                    long_options, NULL)) != -1) {
+        switch (opt) {
+            case 's':
+                server = optarg;
+                break;
+            case 'u':
+                username = optarg;
+                break;
+            case 'p':
+                password = optarg;
+                break;
+            case 'r':;
+                char* endptr;
+                retries = strtol(optarg, &endptr, 10);
+                if (*endptr != '\0') {
+                    fprintf(stderr, "%s: retries must be a number\n\n", PROGRAM_NAME);
+                    usage(EXIT_FAILURE);
+                }
+                break;
+            case 'q':
+                loudness = QUIET;
+                break;
+            case 'l':
+                loudness = LOUD;
+                break;
+            case 'v':
+                version();
+            case 'h':
+                usage(EXIT_SUCCESS);
+            default:
+                fprintf(stderr, "\n");
+                usage(EXIT_FAILURE);
+        }
+    }
+
+    if (optind == argc) {
+        fprintf(stderr, "%s: no files specified\n\n", PROGRAM_NAME);
+        usage(EXIT_FAILURE);
+    }
+
+    if (server == NULL) {
+        fprintf(stderr, "%s: no server specified\n\n", PROGRAM_NAME);
+        usage(EXIT_FAILURE);
+    }
+
+    //parse server
+    int server_len = strlen(server);
+
+    char* ip = strtok(server, ":");
+    int port = 21;
+
+    if (strlen(ip) != server_len) {
+        char* port_str = strtok(NULL, "\0");
+
+        char* endptr;
+        port = strtol(port_str, &endptr, 10);
+        if (*endptr != '\0') {
+            fprintf(stderr, "%s: invalid port\n\n", PROGRAM_NAME);
+            usage(EXIT_FAILURE);
+        }
+    }
+
+    //ask for password if not supplied
+    while (password == NULL) {
+        password = getpass("FTP Password: ");
+    }
+
+    struct FtpCredentials c = {.uname=username, .passwd=password};
+
+    if (loudness) {}
+
+
+    for (int i = optind; i < argc; i++) {
+        char* local_path = argv[i];
+        char* remote_name = basename(local_path);
+
+        if (loudness != QUIET) {
+            printf("Uploading %s\n", remote_name);
         }
 
-        if (i == 4) {
-            printf("Upload failed again. Something's borked. Aborting...\n");
-            return EXIT_FAILURE;
-        }
+        //try to upload and verify the file a maximum of 5 times
+        for (int i = 0; i < retries; i++) {
+            if(upload(ip, port, c, remote_name, local_path) == 0) {
+                break;
+            }
 
-        printf("Upload failed, trying again (%d)...\n", i+1);
+            if (i == retries - 1) {
+                printf("Upload failed again. Something's borked. Aborting...\n");
+                return EXIT_FAILURE;
+            }
+
+            printf("Upload failed, trying again (%d)...\n", i+1);
+        }
     }
 
     return EXIT_SUCCESS;
