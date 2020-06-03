@@ -708,7 +708,7 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
 
                 //connect to pasv port!
                 if (loudness == LOUD) {
-                    printf("Connecting to PASV server and uploading '%s' as '%s\n'",
+                    printf("Connecting to PASV server and uploading '%s' as '%s'\n",
                             path, filename);
                 }
 
@@ -806,7 +806,7 @@ int upload(char* hostname, int port, struct FtpCredentials creds,
                 
                 if (loudness == LOUD) {
                     printf("Configuring hash service to PASV server at %s:%d\n", 
-                            inet_ntoa(pasv_addr.sin_addr), ntohs(pasv_addr.sin_port));
+                            inet_ntoa(pasv2_addr.sin_addr), ntohs(pasv2_addr.sin_port));
                 }
 
                 //set custom port, record old as command port
