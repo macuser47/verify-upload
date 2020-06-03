@@ -114,10 +114,12 @@ void populate_sockaddr(struct sockaddr_in * addr, int port, char* ip) {
 typedef struct {
     char line[1024];
     char* endptr;
+    char* readptr;
 } LineBuffer;
 
 void init_line_buffer(LineBuffer* buf) {
     buf->endptr = buf->line;
+    buf->readptr = NULL;
 }
 
 //purge current line from buffer and shift in rest of buffer
@@ -128,13 +130,11 @@ void consume_line(LineBuffer* buf) {
 //buffer line from socket buffer
 //returns 0 if no line found, 1 if line found
 int get_sock_line(LineBuffer* buf, char* read_buf, size_t read_buf_size) {
-
-    static char* i = NULL;
-    if (i == NULL) {
-        i = read_buf;
+    if (buf->readptr == NULL) {
+        buf->readptr = read_buf;
     }
 
-    for (; i < read_buf + read_buf_size - 1; i++) {
+    for (; buf->readptr < read_buf + read_buf_size - 1; buf->readptr++) {
 
         //reset ptr if it goes beyond the buffer
         if (buf->endptr - buf->line >= sizeof(buf->line)) {
@@ -142,18 +142,18 @@ int get_sock_line(LineBuffer* buf, char* read_buf, size_t read_buf_size) {
         }
 
         //detect \r\n
-        if (*i == '\r' && *(i+1) == '\n') {
-            i++;
+        if (*buf->readptr == '\r' && *(buf->readptr+1) == '\n') {
+            buf->readptr++;
             *buf->endptr = '\0';
             buf->endptr = buf->line;
 
             return 1;
         } 
 
-        *buf->endptr++ = *i;
+        *buf->endptr++ = *buf->readptr;
     }
 
-    i = NULL;
+    buf->readptr = NULL;
     return 0;
 }
 
