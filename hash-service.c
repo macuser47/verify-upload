@@ -50,6 +50,7 @@
 #include <errno.h>
 #include "sha256.h"
 
+char* server_ip;
 
 char* hash_to_string(const unsigned char*);
 
@@ -211,7 +212,7 @@ void* control_session(void* arg) {
             }
 
             struct sockaddr_in addr;
-            populate_sockaddr(&addr, port, "127.0.0.1");
+            populate_sockaddr(&addr, port, server_ip);
             
             struct timeval timeout;
             timeout.tv_sec = 5;
@@ -363,19 +364,23 @@ void run_server(int upload_port) {
 
 
 int main(int argc, char* argv[]) {
-    if (argc > 2) {
-        fprintf(stderr, "Usage: hash-service [port=8009]\n");
-        exit(EXIT_FAILURE);
-    }
-
     int port = 8009;
-    if (argc == 2) {
+    server_ip = "127.0.0.1";
+    switch (argc) {
+    case 3:
+        server_ip = argv[2];
+    case 2:;
         char* endptr;
         port = strtol(argv[1], &endptr, 10);
         if (*endptr != '\0') {
             fprintf(stderr, "Error: invalid port\n");
             exit(EXIT_FAILURE);
         }
+    case 1:
+        break;
+    default:
+        fprintf(stderr, "Usage: hash-service [port=8009] [server_ip=127.0.0.1]\n");
+        exit(EXIT_FAILURE);
     }        
 
     run_server(port);
