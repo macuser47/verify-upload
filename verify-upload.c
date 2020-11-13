@@ -82,8 +82,12 @@ void populate_sockaddr(struct sockaddr_in * addr, int port, char* ip) {
     inet_aton(ip, &addr->sin_addr);
 }
 
-void progress_bar(const int total, const int progress, const int length, 
-        char** bar_string) {
+int max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+void progress_bar(const long long int total, const long long int progress, 
+	const int length, char** bar_string) {
 
     if (*bar_string == NULL) {
         *bar_string = malloc(length + 1);
@@ -94,7 +98,7 @@ void progress_bar(const int total, const int progress, const int length,
 
     int fill_length = (int)(((double)progress / total) * length);
     int i;
-    for (i = 0; i < fill_length - 1; (*bar_string)[i++]='=');
+    for (i = 0; i < max(0, fill_length - 1); (*bar_string)[i++]='=');
     (*bar_string)[i++] = '>';
     for (; i < length; (*bar_string)[i++]=' ');
     (*bar_string)[i] = '\0';
@@ -275,7 +279,7 @@ void bytes_to_human(const long int bytes, char* buf, size_t size) {
 //write progress bar to the screen 
 //returns time in seconds sice last call
 double write_progress(VirtualFd* vstdout, long int accum_sent, 
-        long int filesize, int width) {
+        long long int filesize, int width) {
     static struct timespec last_time;
     static long int last_accum = 0;
     
